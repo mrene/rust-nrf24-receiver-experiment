@@ -8,6 +8,26 @@ use std::io::BufReader;
 use anyhow::Result;
 use num::Zero;
 
+#[derive(Default, Clone, Copy)]
+struct Filter([f32; 8]);
+
+impl Filter {
+    fn new(offset: f32) -> Self {
+        let mut filter = Filter([0f32; 8]);
+        for i in 0..8 {
+            filter.0[i] = sinc(-4.0 + (i as f32) + offset) / 8.0;
+        }
+        filter
+    }
+
+    fn convolve(&self, data: &[f32]) -> f32 {
+        data.iter().rev()
+            .zip(self.0.iter())
+            .map(|(data, tap)| data * tap)
+            .sum()
+    }
+}
+
 fn main() -> Result<()> {
 
     // path to input IQ (10 seconds @ 4MHz sample rate centered at 2460MHz)
@@ -167,24 +187,26 @@ fn bpsk_demod(samples: &[Complex<f32>], sps: f32) -> Vec<u8> {
     // quadrature demodulate
 
     // We can iterate on the previous and current sample by zipping them together
-    let mut soft_demod: Vec<_> =
+    let soft_demod: Vec<_> =
         samples.iter().zip(samples[1..].iter())
             .map(|(previous, current)| {
                 (current.conj() * previous).arg()
             })
             .collect();
 
+
     // generate sinc filter taps for interpolator
-    let taps = {
-        let mut taps = [0f32; 1032];
+    let filters = {
+        let mut taps: [Filter; 129] = [Default::default(); 129];
+
         let mut offset = 0.0;
         let step = 0.25 / 129.0;
-        for i in 0..129 {
-            for itap in 0..8 {
-                taps[i * 8 + itap] = sinc(-4.0 + (itap as f32) + offset) / 8.0;
-            }
+
+        for filter in taps.iter_mut() {
+            *filter = Filter::new(offset);
             offset += step;
         }
+
         taps
     };
 
@@ -202,23 +224,16 @@ fn bpsk_demod(samples: &[Complex<f32>], sps: f32) -> Vec<u8> {
     for i in 0..soft_demod.len() {
 
         // compute the interpolator filter coefficient offset
-        let filter_offset: usize = (((sample_offset * 129.0) as i32) * 8) as usize;
+        let filter_index = (sample_offset * 129.0) as usize;
 
-        // interpolate the output sample
+        interpolated[i] = soft_demod[i];
+
         if i >= 8 {
-            // Frankly I find the previous way more readable, but that's how I'd be tempted to do it in rust
-            // The off-by-1 index in soft_demod is a bit meh.
-            interpolated[i] = {
-                let taps_it = taps[filter_offset..filter_offset + 8].iter();
-                let previous_samples = soft_demod[i - 7..i + 1].iter().rev();
-
-                taps_it.zip(previous_samples)
-                    .map(|(tap, sample)| sample * tap)
-                    .sum()
-            };
-            soft_demod[i] = interpolated[i];
+            // interpolate the output sample
+            // XXX: Why is the convolution on the previous *output* samples (+ the current one)
+            // instead of the previous input ones?
+            interpolated[i] = filters[filter_index].convolve(&interpolated[i - 7..i + 1]);
         }
-
         // calculate the error value (Muller & Mueller)
         let error = slice(last_sample) * interpolated[i] - slice(interpolated[i]) * last_sample;
         last_sample = interpolated[i];
@@ -228,8 +243,8 @@ fn bpsk_demod(samples: &[Complex<f32>], sps: f32) -> Vec<u8> {
         sps_actual = sps_actual.min(sps_expected + sps_tolerance).max(sps_expected - sps_tolerance);
 
         // update the fractional sample offset
-        sample_offset = sample_offset + sps_actual + gain_sample_offset * error;
-        sample_offset = sample_offset - sample_offset.floor();
+        sample_offset += sps_actual + gain_sample_offset * error;
+        sample_offset -= sample_offset.floor();
     }
 
     // Slice the bits
